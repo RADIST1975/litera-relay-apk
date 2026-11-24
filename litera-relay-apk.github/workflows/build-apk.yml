@@ -1,0 +1,201 @@
+name: Build Litera Relay APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node & Java
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Init Capacitor Project
+        run: |
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android nodejs-mobile-capacitor
+          mkdir -p www
+          cat << 'EOF' > www/index.html
+          <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <body style="font-family:sans-serif;background:#0a0a0c;color:#eee;padding:24px">
+          <h2>Litera Link Relay v2.0</h2>
+          <p id="s">Запуск сервера...</p>
+          <script>
+            setInterval(async()=>{
+              try{
+                const r=await fetch('http://127.0.0');
+                const d=await r.json();
+                document.getElementById('s').innerHTML='Статус: <b style="color:#4f4">Працює (порт 3100)</b><br>Zones: '+d.zones+' | Queues: '+d.queues;
+              }catch(e){}
+            },2000);
+          </script></body>
+          EOF
+          npx cap init "Litera Relay" "com.litera.relay" --web-dir www
+          npx cap add android
+
+      - name: Add Node Server Code
+        run: |
+          mkdir -p android/app/src/main/assets/nodejs-project
+          cd android/app/src/main/assets/nodejs-project
+          npm init -y
+          npm install ws
+          cat << 'EOF' > main.js
+          "use strict";
+          const http = require("http");
+          const crypto = require("crypto");
+          const { WebSocketServer } = require("ws");
+
+          const PORT = process.env.PORT || 3100;
+          const zones = new Map();
+          const queues = new Map();
+
+          function roomId(zoneKey, channel, color) {
+            const raw = [zoneKey || "", channel || "1", color || "none"].map((s) => String(s).trim()).join("|");
+            return crypto.createHash("sha256").update("litera-room-v1:" + raw).digest("hex");
+          }
+
+          function send(ws, type, payload = {}) {
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type, ...payload }));
+          }
+
+          function broadcastZone(zone, exceptId, type, payload) {
+            for (const [id, m] of zone.members) {
+              if (id !== exceptId) send(m.ws, type, payload);
+            }
+          }
+
+          const server = http.createServer((req, res) => {
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            if (req.url === "/status" || req.url === "/health") {
+              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+              return res.end(JSON.stringify({ ok: true, service: "litera-link", version: "2.0", zones: zones.size, queues: queues.size }, null, 2));
+            }
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+            res.end(`<h1>Litera Link Relay</h1><p>Port: ${PORT}</p>`);
+          });
+
+          const wss = new WebSocketServer({ server });
+
+          wss.on("connection", (ws) => {
+            const meta = { zoneId: null, deviceId: null, displayName: null, queues: new Set() };
+            ws.on("message", (raw) => {
+              let msg;
+              try { msg = JSON.parse(raw.toString()); } catch { return send(ws, "error", { message: "Invalid JSON" }); }
+              const { type } = msg;
+              if (type === "ping") return send(ws, "pong", { t: Date.now() });
+
+              if (type === "queue.create") {
+                const queueId = msg.queueId || crypto.randomBytes(16).toString("hex");
+                if (!queues.has(queueId)) queues.set(queueId, { owner: msg.deviceId || null, subs: new Set(), buffer: [] });
+                const q = queues.get(queueId);
+                q.subs.add(ws); meta.queues.add(queueId);
+                send(ws, "queue.created", { queueId });
+                for (const env of q.buffer.splice(0)) send(ws, "queue.deliver", env);
+                return;
+              }
+              if (type === "queue.subscribe") {
+                const queueId = msg.queueId;
+                if (!queueId) return send(ws, "error", { message: "queueId required" });
+                if (!queues.has(queueId)) queues.set(queueId, { owner: null, subs: new Set(), buffer: [] });
+                const q = queues.get(queueId);
+                q.subs.add(ws); meta.queues.add(queueId);
+                send(ws, "queue.subscribed", { queueId });
+                for (const env of q.buffer.splice(0)) send(ws, "queue.deliver", env);
+                return;
+              }
+              if (type === "queue.send") {
+                const queueId = msg.queueId;
+                if (!queueId || !msg.ciphertext) return send(ws, "error", { message: "queueId+ciphertext required" });
+                if (!queues.has(queueId)) queues.set(queueId, { owner: null, subs: new Set(), buffer: [] });
+                const q = queues.get(queueId);
+                const envelope = { queueId, messageId: msg.messageId || crypto.randomUUID(), fromName: msg.fromName || null, ciphertext: msg.ciphertext, nonce: msg.nonce, timestamp: Date.now() };
+                let delivered = 0;
+                for (const sub of [...q.subs]) {
+                  if (sub === ws) continue;
+                  if (sub.readyState === 1) { send(sub, "queue.deliver", envelope); delivered++; }
+                  else q.subs.delete(sub);
+                }
+                if (delivered === 0 && q.buffer.length < 50) q.buffer.push(envelope);
+                send(ws, "queue.sent", { messageId: envelope.messageId, delivered });
+                return;
+              }
+              if (type === "zone.join") {
+                const { zoneKey, deviceId, displayName } = msg;
+                const channel = String(msg.channel || "1");
+                const color = String(msg.color || "none");
+                if (!zoneKey || !deviceId || !displayName) return send(ws, "error", { message: "zoneKey, deviceId, displayName required" });
+                const zoneId = roomId(zoneKey, channel, color);
+                if (!zones.has(zoneId)) zones.set(zoneId, { members: new Map() });
+                const zone = zones.get(zoneId);
+                zone.members.set(deviceId, { ws, displayName });
+                meta.zoneId = zoneId; meta.deviceId = deviceId; meta.displayName = displayName;
+                const members = [];
+                for (const [id, m] of zone.members) if (id !== deviceId) members.push({ deviceId: id, displayName: m.displayName });
+                send(ws, "zone.joined", { zoneId, deviceId, displayName, channel, color, members, memberCount: zone.members.size });
+                broadcastZone(zone, deviceId, "member.joined", { deviceId, displayName, memberCount: zone.members.size });
+                return;
+              }
+              if (type === "message.send") {
+                if (!meta.zoneId) return send(ws, "error", { message: "Join zone or use queue.send" });
+                const zone = zones.get(meta.zoneId);
+                if (!zone) return;
+                const envelope = { messageId: msg.messageId || crypto.randomUUID(), from: meta.deviceId, fromId: meta.deviceId, fromName: meta.displayName, ciphertext: msg.ciphertext, nonce: msg.nonce, timestamp: Date.now() };
+                let delivered = 0;
+                for (const [id, m] of zone.members) {
+                  if (id === meta.deviceId) continue;
+                  send(m.ws, "message.new", envelope); delivered++;
+                }
+                send(ws, "message.sent", { messageId: envelope.messageId, delivered, memberCount: zone.members.size });
+                return;
+              }
+              if (type === "rtc.signal" && meta.zoneId) {
+                const zone = zones.get(meta.zoneId);
+                if (!zone) return;
+                const payload = { from: meta.deviceId, fromId: meta.deviceId, fromName: meta.displayName, signal: msg.signal, callId: msg.callId || null, media: msg.media || "audio" };
+                if (msg.to || msg.toId) {
+                  const peer = zone.members.get(msg.to || msg.toId);
+                  if (peer) send(peer.ws, "rtc.signal", payload);
+                } else {
+                  broadcastZone(zone, meta.deviceId, "rtc.signal", payload);
+                }
+                return;
+              }
+              send(ws, "error", { message: "Unknown type: " + type });
+            });
+            ws.on("close", () => {
+              if (meta.zoneId && meta.deviceId) {
+                const zone = zones.get(meta.zoneId);
+                if (zone) {
+                  zone.members.delete(meta.deviceId);
+                  broadcastZone(zone, meta.deviceId, "member.left", { deviceId: meta.deviceId, displayName: meta.displayName, memberCount: zone.members.size });
+                  if (zone.members.size === 0) zones.delete(meta.zoneId);
+                }
+              }
+              for (const qid of meta.queues) {
+                const q = queues.get(qid);
+                if (q) { q.subs.delete(ws); if (q.subs.size === 0 && q.buffer.length === 0) queues.delete(qid); }
+              }
+            });
+          });
+
+          server.listen(PORT, "0.0.0.0", () => {
+            console.log("Litera Link Relay v2.0 running on " + PORT);
+          });
+          EOF
+          npx cap sync
+
+      - name: Build Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Litera-Link-Relay-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
